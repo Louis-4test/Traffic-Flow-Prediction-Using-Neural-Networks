@@ -3,22 +3,13 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 import matplotlib.pyplot as plt
-
-# Set random seed for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 # Load and inspect the dataset
 data = pd.read_csv("/content/synthetic_traffic_data.csv")
 print(data.info())
-
-# Ensure necessary columns exist
-required_columns = ['timestamp', 'temperature', 'humidity', 'traffic_flow']
-for col in required_columns:
-    if col not in data.columns:
-        raise ValueError(f"Missing required column: {col}")
 
 # Handle missing values
 data.ffill(inplace=True)
@@ -39,7 +30,7 @@ data[['temperature', 'humidity', 'traffic_flow']] = scaler.fit_transform(
 )
 
 # Add lag features for traffic_flow
-for lag in range(1, 7):  # Previous 6 hours
+for lag in range(1, 4):  # Previous 3 hours
     data[f'lag_{lag}'] = data['traffic_flow'].shift(lag)
 data.dropna(inplace=True)  # Drop rows with NaN values due to lagging
 
@@ -47,53 +38,104 @@ data.dropna(inplace=True)  # Drop rows with NaN values due to lagging
 X = data.drop(['traffic_flow', 'timestamp'], axis=1)
 y = data['traffic_flow']
 
-# Split data into training and test sets
+# Define hyperparameter grid
+param_grid = {
+    'units': [50],  # Number of LSTM units
+    'dropout_rate': [0.2],  # Dropout rates
+    'batch_size': [32],  # Batch sizes
+    'learning_rate': [0.001]  # Learning rates
+}
+
+# Initialize variables to store best model and results
+best_model = None
+best_params = None
+lowest_rmse = float('inf')
+
+# Perform k-fold cross-validation
+kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+for units in param_grid['units']:
+    for dropout_rate in param_grid['dropout_rate']:
+        for batch_size in param_grid['batch_size']:
+            for learning_rate in param_grid['learning_rate']:
+
+                fold_rmse = []
+
+                for train_index, val_index in kf.split(X):
+                    X_train, X_val = X.values[train_index], X.values[val_index]
+                    y_train, y_val = y.values[train_index], y.values[val_index]
+
+                    # Build LSTM model with Input layer
+                    model = tf.keras.Sequential([
+                        layers.Input(shape=(X_train.shape[1], 1)),  # Use Input layer to specify input shape
+                        layers.LSTM(units, activation='tanh', return_sequences=True),
+                        layers.Dropout(dropout_rate),
+                        layers.LSTM(units, activation='tanh'),
+                        layers.Dropout(dropout_rate),
+                        layers.Dense(1)  # Regression output
+                    ])
+
+                    # Compile the model
+                    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+                    model.compile(optimizer=optimizer, loss='mean_squared_error', metrics=['mae'])
+
+                    # Train the model
+                    history = model.fit(
+                        X_train, y_train,
+                        validation_data=(X_val, y_val),
+                        epochs=5,
+                        batch_size=batch_size,
+                        verbose=0
+                    )
+
+                    # Evaluate the model on the validation set
+                    y_pred = model.predict(X_val)
+                    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+                    fold_rmse.append(rmse)
+
+                # Calculate average RMSE for this hyperparameter set
+                avg_rmse = np.mean(fold_rmse)
+
+                # Update best model if current RMSE is lower
+                if avg_rmse < lowest_rmse:
+                    lowest_rmse = avg_rmse
+                    best_model = model
+                    best_params = {
+                        'units': units,
+                        'dropout_rate': dropout_rate,
+                        'batch_size': batch_size,
+                        'learning_rate': learning_rate
+                    }
+
+# Display best parameters and lowest RMSE
+print(f"Best Parameters: {best_params}")
+print(f"Lowest RMSE: {lowest_rmse:.4f}")
+
+# Evaluate the best model on the test set
 X_train, X_test, y_train, y_test = train_test_split(X.values, y.values, test_size=0.2, random_state=42)
+y_test_pred = best_model.predict(X_test)
+test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+test_mae = mean_absolute_error(y_test, y_test_pred)
 
-# Define the model with an explicit Input layer
-model = tf.keras.Sequential([
-    layers.Input(shape=(X_train.shape[1],)),  # Explicit input layer
-    layers.Dense(128, activation='relu'),
-    layers.Dropout(0.3),  # Increased dropout rate for better regularization
-    layers.Dense(64, activation='relu'),
-    layers.Dropout(0.3),
-    layers.Dense(1)  # Single output for regression
-])
+print(f"Test RMSE: {test_rmse:.4f}")
+print(f"Test MAE: {test_mae:.4f}")
 
-# Compile the model
-model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
-
-# Train the model
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=50,
-    batch_size=32
-)
-
-# Plot training and validation loss
+# Visualize predictions vs actual values
 plt.figure(figsize=(10, 6))
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Model Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
+plt.plot(y_test[:100], label='Actual', marker='o')
+plt.plot(y_test_pred[:100], label='Predicted', marker='x')
+plt.title('Predicted vs Actual Traffic Flow')
+plt.xlabel('Sample Index')
+plt.ylabel('Traffic Flow')
 plt.legend()
 plt.show()
 
-# Evaluate the model on the test set
-test_loss, test_mae = model.evaluate(X_test, y_test, verbose=0)
-print(f"Test Loss: {test_loss:.4f}, Test MAE: {test_mae:.4f}")
-
-# Additional evaluation: R-squared and MAPE
-y_pred = model.predict(X_test).flatten()
-
-# R-squared calculation
-ss_total = np.sum((y_test - np.mean(y_test)) ** 2)
-ss_residual = np.sum((y_test - y_pred) ** 2)
-r_squared = 1 - (ss_residual / ss_total)
-print(f"R-squared: {r_squared:.4f}")
-
-# MAPE calculation
-mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
-print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+# Visualize the relationship between weather and traffic flow
+plt.figure(figsize=(10, 6))
+plt.scatter(data['temperature'], data['traffic_flow'], alpha=0.5, label='Temperature vs Traffic Flow')
+plt.scatter(data['humidity'], data['traffic_flow'], alpha=0.5, label='Humidity vs Traffic Flow', color='orange')
+plt.title('Weather vs Traffic Flow')
+plt.xlabel('Weather Conditions')
+plt.ylabel('Traffic Flow')
+plt.legend()
+plt.show()
